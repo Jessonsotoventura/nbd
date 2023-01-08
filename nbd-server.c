@@ -185,6 +185,7 @@ int dontfork = 0;
 #define F_DUAL_LISTEN 8	  /**< Listen on both TCP and unix socket */
 // also accepts F_FORCEDTLS (which is 16384)
 GHashTable *children;
+GHashTable *connections;
 char pidfname[256]; /**< name of our PID file */
 char default_authname[] = SYSCONFDIR "/nbd-server/allow"; /**< default name of allow file */
 
@@ -2104,6 +2105,7 @@ static void setup_transactionlog(CLIENT *client) {
 static bool commit_client(CLIENT* client, SERVER* server) {
 	char acl;
 	uint32_t len;
+	pid_t *pidp;
 
 	client->server = serve_inc_ref(server);
 	client->exportsize = OFFT_MAX;
@@ -2121,9 +2123,12 @@ static bool commit_client(CLIENT* client, SERVER* server) {
 	if(dontfork) {
 		acl = 'Y';
 	} else {
+		pidp = g_malloc(sizeof(pid_t));
+		*pidp = getpid();
 		len = strlen(client->server->servename);
 		writeit(commsocket, &len, sizeof len);
 		writeit(commsocket, client->server->servename, len);
+		writeit(commsocket, pidp, sizeof(pid_t));
 		readit(commsocket, &acl, 1);
 		close(commsocket);
 	}
@@ -3086,6 +3091,7 @@ static int handle_childname(GArray* servers, int socket)
 	uint32_t len;
 	char *buf;
 	int i, r, rt = 0;
+	pid_t* pid; 
 
 	while(rt < sizeof(len)) {
 		switch((r = read(socket, &len, sizeof len))) {
@@ -3102,12 +3108,15 @@ static int handle_childname(GArray* servers, int socket)
 	buf = g_malloc0(len + 1);
 	readit(socket, buf, len);
 	buf[len] = 0;
+	pid = g_malloc(sizeof(pid_t));
+	readit(socket, pid, sizeof(pid_t));
 	for(i=0; i<servers->len; i++) {
 		SERVER* srv = g_array_index(servers, SERVER*, i);
 		if(strcmp(srv->servename, buf) == 0) {
 			if(srv->max_connections == 0 || srv->max_connections > srv->numclients) {
 				writeit(socket, "Y", 1);
 				srv->numclients++;
+				g_hash_table_insert(connections, pid, GINT_TO_POINTER(i));
 			} else {
 				writeit(socket, "N", 1);
 			}
@@ -3240,6 +3249,8 @@ void serveloop(GArray* servers, struct generic_conf *genconf) {
 		if (is_sigchld_caught) {
 			int status;
 			int* i;
+			int index;
+			bool found;
 			pid_t pid;
 
 			is_sigchld_caught = 0;
@@ -3254,6 +3265,14 @@ void serveloop(GArray* servers, struct generic_conf *genconf) {
 				} else {
 					DEBUG("Removing %d from the list of children", pid);
 					g_hash_table_remove(children, &pid);
+					found = g_hash_table_lookup_extended(connections, &pid, NULL, (gpointer) &index);
+					if(found){
+						SERVER* srv = g_array_index(servers, SERVER*, index);
+						if (srv){ 
+							srv->numclients--;
+							g_hash_table_remove(connections, &pid);
+						}
+					}
 				}
 			}
 		}
@@ -3534,6 +3553,7 @@ void setup_servers(GArray *const servers, const gchar *const modernaddr,
 		}
 	}
 	children=g_hash_table_new_full(g_int_hash, g_int_equal, NULL, destroy_pid_t);
+	connections=g_hash_table_new_full(g_int_hash, g_int_equal, destroy_pid_t, NULL);
 
 	sa.sa_handler = sigchld_handler;
 	sigemptyset(&sa.sa_mask);
